@@ -36,10 +36,9 @@ func main() {
 
 	Debug("Yuhu! New client: %q", client)
 
-	// Apparently all is good... Let us now handle connection :)
-	// We don't want this to be inside of new connection as who knows where it my lead us.
-	// Remember that this is crutial part in handling incoming messages :)
-	go client.Handle()
+	// Client.Handle 默认自动重连；ResubscribeOnReconnect 在每次重连成功后自动重新订阅
+	client.ResubscribeOnReconnect = "events json ALL"
+	client.Handle()
 
 	client.Send("events json ALL")
 
