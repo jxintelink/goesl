@@ -8,6 +8,7 @@ package goesl
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -35,7 +36,7 @@ func (c *Client) EstablishConnection() error {
 
 	c.SocketConnection = SocketConnection{
 		Conn: conn,
-		err:  make(chan error),
+		err:  make(chan error, 1),
 		m:    make(chan *Message),
 	}
 
@@ -45,6 +46,10 @@ func (c *Client) EstablishConnection() error {
 // Authenticate - Method used to authenticate client against freeswitch. In case of any errors durring so
 // we will return error.
 func (c *Client) Authenticate() error {
+	return c.authenticate()
+}
+
+func (c *Client) authenticate() error {
 
 	m, err := newMessage(bufio.NewReaderSize(c, ReadBufferSize), false)
 	if err != nil {
@@ -83,6 +88,57 @@ func (c *Client) Authenticate() error {
 	}
 
 	return nil
+}
+
+// Reconnect 关闭当前连接（若存在），重新拨号并完成 ESL 认证，并重建内部消息通道。
+// 典型用法：ReadMessage/Handle 返回错误或检测到断线后，在同一线程或已停止并发读写的时机调用。
+// 不要在仍有 goroutine 对同一 Client 执行 ReadMessage 时并发调用 Reconnect，否则可能永远阻塞在旧通道上。
+func (c *Client) Reconnect() error {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+
+	if c.Conn != nil {
+		_ = c.Conn.Close()
+		c.Conn = nil
+	}
+
+	conn, err := c.Dial(c.Proto, c.Addr, time.Duration(c.Timeout*int(time.Second)))
+	if err != nil {
+		return err
+	}
+
+	c.Conn = conn
+	c.err = make(chan error, 1)
+	c.m = make(chan *Message)
+
+	if err := c.authenticate(); err != nil {
+		_ = c.Conn.Close()
+		c.Conn = nil
+		return err
+	}
+
+	return nil
+}
+
+// ReconnectWithRetry 在 Reconnect 失败时按 interval 等待后重试。
+// maxAttempts > 0 时最多尝试 maxAttempts 次（每次均执行一次完整的关闭/拨号/认证）；
+// maxAttempts <= 0 时在 ctx 取消前无限重试。interval 建议大于 0，以避免 tight loop。
+func (c *Client) ReconnectWithRetry(ctx context.Context, maxAttempts int, interval time.Duration) error {
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		lastErr = c.Reconnect()
+		if lastErr == nil {
+			return nil
+		}
+		if maxAttempts > 0 && attempt >= maxAttempts {
+			return fmt.Errorf("goesl: reconnect failed after %d attempts: %w", maxAttempts, lastErr)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("goesl: reconnect cancelled (after %d attempts): %w; last error: %v", attempt, ctx.Err(), lastErr)
+		case <-time.After(interval):
+		}
+	}
 }
 
 // NewClient - Will initiate new client that will establish connection and attempt to authenticate

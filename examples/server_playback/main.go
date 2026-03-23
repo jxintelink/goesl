@@ -4,28 +4,37 @@
 // I didn't write all of this code so you could say it's yours.
 // MIT License
 
-package examples
+package main
 
 import (
-	. "github.com/0x19/goesl"
+	"fmt"
+	. "github.com/jxintelink/goesl"
+	"os"
 	"runtime"
 	"strings"
 )
 
-var (
-	goeslMessage = "Hello from GoESL. Open source freeswitch event socket wrapper written in Golang!"
-)
+var welcomeFile = "%s/media/welcome.wav"
 
 func main() {
 
 	defer func() {
 		if r := recover(); r != nil {
-			Error("Recovered in: ", r)
+			Error("Recovered in f", r)
 		}
 	}()
 
 	// Boost it as much as it can go ...
 	runtime.GOMAXPROCS(runtime.NumCPU())
+
+	wd, err := os.Getwd()
+
+	if err != nil {
+		Error("Error while attempt to get WD: %s", wd)
+		os.Exit(1)
+	}
+
+	welcomeFile = fmt.Sprintf(welcomeFile, wd)
 
 	if s, err := NewOutboundServer(":8084"); err != nil {
 		Error("Got error while starting Freeswitch outbound server: %s", err)
@@ -36,7 +45,7 @@ func main() {
 
 }
 
-// handle - Running under goroutine here to explain how to run tts outbound server
+// handle - Running under goroutine here to explain how to handle playback ( play to the caller )
 func handle(s *OutboundServer) {
 
 	for {
@@ -63,23 +72,11 @@ func handle(s *OutboundServer) {
 
 			cUUID := answer.GetCallUUID()
 
-			if te, err := conn.ExecuteSet("tts_engine", "flite", false); err != nil {
-				Error("Got error while attempting to set tts_engine: %s", err)
-			} else {
-				Debug("TTS Engine Msg: %s", te)
-			}
-
-			if tv, err := conn.ExecuteSet("tts_voice", "slt", false); err != nil {
-				Error("Got error while attempting to set tts_voice: %s", err)
-			} else {
-				Debug("TTS Voice Msg: %s", tv)
-			}
-
-			if sm, err := conn.Execute("speak", goeslMessage, true); err != nil {
-				Error("Got error while executing speak: %s", err)
+			if sm, err := conn.Execute("playback", welcomeFile, true); err != nil {
+				Error("Got error while executing playback: %s", err)
 				break
 			} else {
-				Debug("Speak Message: %s", sm)
+				Debug("Playback Message: %s", sm)
 			}
 
 			if hm, err := conn.ExecuteHangup(cUUID, "", false); err != nil {

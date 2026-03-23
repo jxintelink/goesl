@@ -4,12 +4,12 @@
 // I didn't write all of this code so you could say it's yours.
 // MIT License
 
-package examples
+package main
 
 import (
 	"flag"
 	"fmt"
-	. "github.com/0x19/goesl"
+	. "github.com/jxintelink/goesl"
 	"runtime"
 	"strings"
 )
