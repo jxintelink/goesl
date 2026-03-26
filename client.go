@@ -1,19 +1,13 @@
-// Copyright 2015 Nevio Vesic
-// Please check out LICENSE file for more information about what you CAN and what you CANNOT do!
-// Basically in short this is a free software for you to do whatever you want to do BUT copyright must be included!
-// I didn't write all of this code so you could say it's yours.
-// MIT License
-
 package goesl
 
 import (
 	"bufio"
-	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 )
 
@@ -27,29 +21,105 @@ type Client struct {
 	Passwd  string `json:"freeswitch_password"`
 	Timeout int    `json:"freeswitch_connection_timeout"`
 
-	// DisableAutoReconnect 为 true 时使用 SocketConnection.Handle（断线即关闭，不自动重拨）。
-	DisableAutoReconnect bool `json:"-"`
+	// 内部状态管理
+	mu            sync.RWMutex
+	connected     bool
+	reconnecting  bool
+	stopHeartbeat chan struct{}
+}
 
-	// HandleContext 控制自动重连生命周期，nil 时使用 context.Background()。
-	HandleContext context.Context `json:"-"`
+// 添加状态检查方法
+func (c *Client) isConnected() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.connected
+}
 
-	// AutoReconnectInterval 为两次重连尝试之间的等待时间；<=0 时默认 3s。
-	AutoReconnectInterval time.Duration `json:"-"`
+func (c *Client) setConnected(state bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.connected = state
+}
 
-	// ResubscribeOnReconnect 非空时，每次重连成功后会通过 Send 发送该命令（常见如 "events json ALL"）。
-	ResubscribeOnReconnect string `json:"-"`
+func (c *Client) isReconnecting() bool {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.reconnecting
+}
+
+func (c *Client) setReconnecting(state bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.reconnecting = state
+}
+
+// 心跳检测
+func (c *Client) startHeartbeat() {
+	c.stopHeartbeat = make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-ticker.C:
+				if err := c.Send("api status"); err != nil {
+					Debug("Heartbeat failed: %v", err)
+					c.setConnected(false)
+					go c.reconnect()
+				}
+			case <-c.stopHeartbeat:
+				return
+			}
+		}
+	}()
+}
+
+// 重连逻辑
+func (c *Client) reconnect() {
+	if c.isReconnecting() {
+		return
+	}
+	c.setReconnecting(true)
+	defer c.setReconnecting(false)
+
+	for !c.isConnected() {
+		Debug("Attempting immediate reconnection...")
+
+		// 关闭旧连接
+		c.Close()
+
+		// 立即尝试重新建立连接
+		if err := c.EstablishConnection(); err != nil {
+			Debug("Connection failed: %v", err)
+			continue  // 立即重试，不等待
+		}
+
+		// 重新认证
+		if err := c.Authenticate(); err != nil {
+			Debug("Authentication failed: %v", err)
+			continue  // 立即重试，不等待
+		}
+
+		c.setConnected(true)
+		Debug("Successfully reconnected")
+
+		// 重新启动心跳检测
+		c.startHeartbeat()
+		return
+	}
 }
 
 // EstablishConnection - Will attempt to establish connection against freeswitch and create new SocketConnection
 func (c *Client) EstablishConnection() error {
-	conn, err := c.Dial(c.Proto, c.Addr, time.Duration(c.Timeout*int(time.Second)))
+	conn, err := c.Dial(c.Proto, c.Addr, time.Duration(c.Timeout)*time.Second)
 	if err != nil {
 		return err
 	}
 
 	c.SocketConnection = SocketConnection{
 		Conn: conn,
-		err:  make(chan error, 1),
+		err:  make(chan error),
 		m:    make(chan *Message),
 	}
 
@@ -59,10 +129,6 @@ func (c *Client) EstablishConnection() error {
 // Authenticate - Method used to authenticate client against freeswitch. In case of any errors durring so
 // we will return error.
 func (c *Client) Authenticate() error {
-	return c.authenticate()
-}
-
-func (c *Client) authenticate() error {
 
 	m, err := newMessage(bufio.NewReaderSize(c, ReadBufferSize), false)
 	if err != nil {
@@ -103,193 +169,16 @@ func (c *Client) authenticate() error {
 	return nil
 }
 
-// AutoReconnectConfig 控制 HandleWithAutoReconnect 在断线后的重连行为。
-type AutoReconnectConfig struct {
-	// MaxAttempts 单次断线后，连续重拨+认证的最大尝试次数；<=0 表示在 ctx 取消前无限重试。
-	MaxAttempts int
-	// Interval 两次重连尝试之间的等待时间，建议 >0。
-	Interval time.Duration
-	// OnReconnected 每次重连成功、即将恢复读流前调用，可在此重新执行 event 订阅等。
-	OnReconnected func()
-}
-
-// reconnect 重新拨号并完成认证。replaceChannels 为 true 时重建 err/m（与 Reconnect 一致）；
-// 为 false 时保留原有通道，供断线自动重连时 ReadMessage 仍从同一 c.m 取消息。
-func (c *Client) reconnect(replaceChannels bool) error {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-
-	if c.Conn != nil {
-		_ = c.Conn.Close()
-		c.Conn = nil
-	}
-
-	conn, err := c.Dial(c.Proto, c.Addr, time.Duration(c.Timeout*int(time.Second)))
-	if err != nil {
-		return err
-	}
-
-	c.Conn = conn
-	if replaceChannels {
-		c.err = make(chan error, 1)
-		c.m = make(chan *Message)
-	}
-
-	if err := c.authenticate(); err != nil {
-		_ = c.Conn.Close()
-		c.Conn = nil
-		return err
-	}
-
-	return nil
-}
-
-// Reconnect 关闭当前连接（若存在），重新拨号并完成 ESL 认证，并重建内部消息通道。
-// 典型用法：ReadMessage/Handle 返回错误或检测到断线后，在同一线程或已停止并发读写的时机调用。
-// 不要在仍有 goroutine 对同一 Client 执行 ReadMessage 时并发调用 Reconnect，否则可能永远阻塞在旧通道上。
-func (c *Client) Reconnect() error {
-	return c.reconnect(true)
-}
-
-// ReconnectWithRetry 在 Reconnect 失败时按 interval 等待后重试。
-// maxAttempts > 0 时最多尝试 maxAttempts 次（每次均执行一次完整的关闭/拨号/认证）；
-// maxAttempts <= 0 时在 ctx 取消前无限重试。interval 建议大于 0，以避免 tight loop。
-func (c *Client) ReconnectWithRetry(ctx context.Context, maxAttempts int, interval time.Duration) error {
-	var lastErr error
-	for attempt := 1; ; attempt++ {
-		lastErr = c.reconnect(true)
-		if lastErr == nil {
-			return nil
-		}
-		if maxAttempts > 0 && attempt >= maxAttempts {
-			return fmt.Errorf("goesl: reconnect failed after %d attempts: %w", maxAttempts, lastErr)
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("goesl: reconnect cancelled (after %d attempts): %w; last error: %v", attempt, ctx.Err(), lastErr)
-		case <-time.After(interval):
-		}
-	}
-}
-
-func (c *Client) reconnectWithRetryKeepChannels(ctx context.Context, maxAttempts int, interval time.Duration) error {
-	var lastErr error
-	for attempt := 1; ; attempt++ {
-		lastErr = c.reconnect(false)
-		if lastErr == nil {
-			return nil
-		}
-		if maxAttempts > 0 && attempt >= maxAttempts {
-			return fmt.Errorf("goesl: reconnect failed after %d attempts: %w", maxAttempts, lastErr)
-		}
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("goesl: reconnect cancelled (after %d attempts): %w; last error: %v", attempt, ctx.Err(), lastErr)
-		case <-time.After(interval):
-		}
-	}
-}
-
-// HandleWithAutoReconnect 在后台持续读取 ESL 并将消息写入 c.m（与 Handle 相同消费方式）。
-// 读失败时自动关闭旧连接并按 cfg 重拨、认证，不替换 err/m，ReadMessage 可在重连后继续阻塞等待新消息。
-// OnReconnected 中请重新发送 events 等订阅，否则可能收不到事件。
-// ctx 取消时关闭连接并结束；重连耗尽后向 c.err 写入错误并退出。
-func (c *Client) HandleWithAutoReconnect(ctx context.Context, cfg AutoReconnectConfig) {
-	go func() {
-		defer func() {
-			_ = c.Close()
-		}()
-		for {
-			if ctx.Err() != nil {
-				return
-			}
-			rbuf := bufio.NewReaderSize(c, ReadBufferSize)
-			readDead := make(chan error, 1)
-			go func() {
-				for {
-					msg, err := newMessage(rbuf, true)
-					if err != nil {
-						readDead <- err
-						return
-					}
-					select {
-					case c.m <- msg:
-					case <-ctx.Done():
-						readDead <- ctx.Err()
-						return
-					}
-				}
-			}()
-			var readErr error
-			select {
-			case <-ctx.Done():
-				_ = c.Close()
-				return
-			case readErr = <-readDead:
-			}
-			if errors.Is(readErr, context.Canceled) || errors.Is(readErr, context.DeadlineExceeded) {
-				return
-			}
-			Warning("goesl: ESL read failed (%v), reconnecting ...", readErr)
-			if err := c.reconnectWithRetryKeepChannels(ctx, cfg.MaxAttempts, cfg.Interval); err != nil {
-				select {
-				case c.err <- err:
-				default:
-				}
-				return
-			}
-			if cfg.OnReconnected != nil {
-				cfg.OnReconnected()
-			}
-		}
-	}()
-}
-
-// Handle 对 Inbound Client 默认启用断线自动重连（见 HandleWithAutoReconnect），本方法立即返回。
-// 可在首次连上后照常 Send("events ...")；若设置了 ResubscribeOnReconnect，重连成功后会自动再次 Send。
-// 需要原版单次连接读循环时，设 DisableAutoReconnect=true（内部仍会起 goroutine，行为同旧版 go + SocketConnection.Handle）。
-func (c *Client) Handle() {
-	if c.DisableAutoReconnect {
-		go func() {
-			c.SocketConnection.Handle()
-		}()
-		return
-	}
-
-	ctx := c.HandleContext
-	if ctx == nil {
-		ctx = context.Background()
-	}
-
-	interval := c.AutoReconnectInterval
-	if interval <= 0 {
-		interval = 3 * time.Second
-	}
-
-	resub := c.ResubscribeOnReconnect
-	cfg := AutoReconnectConfig{
-		MaxAttempts: 0,
-		Interval:    interval,
-		OnReconnected: func() {
-			if resub == "" {
-				return
-			}
-			if err := c.Send(resub); err != nil {
-				Error("goesl: ResubscribeOnReconnect Send: %v", err)
-			}
-		},
-	}
-	c.HandleWithAutoReconnect(ctx, cfg)
-}
-
 // NewClient - Will initiate new client that will establish connection and attempt to authenticate
 // against connected freeswitch server
 func NewClient(host string, port uint, passwd string, timeout int) (*Client, error) {
 	client := Client{
-		Proto:   "tcp", // Let me know if you ever need this open up lol
-		Addr:    net.JoinHostPort(host, strconv.Itoa(int(port))),
-		Passwd:  passwd,
-		Timeout: timeout,
+		Proto:        "tcp",
+		Addr:         net.JoinHostPort(host, strconv.Itoa(int(port))),
+		Passwd:       passwd,
+		Timeout:      timeout,
+		connected:    false,
+		reconnecting: false,
 	}
 
 	err := client.EstablishConnection()
@@ -303,5 +192,61 @@ func NewClient(host string, port uint, passwd string, timeout int) (*Client, err
 		return nil, err
 	}
 
+	client.connected = true
+	client.startHeartbeat()
 	return &client, nil
+}
+
+// Close - Will close the connection to freeswitch server
+func (c *Client) Close() error {
+	// 只在确实需要关闭时才完全关闭
+	if c.isConnected() {
+		if c.stopHeartbeat != nil {
+			close(c.stopHeartbeat)
+			c.stopHeartbeat = nil
+		}
+		c.setConnected(false)
+		return c.SocketConnection.Close()
+	}
+	return nil
+}
+
+// Read - Will read data from freeswitch server
+func (c *Client) Read(b []byte) (n int, err error) {
+	n, err = c.Conn.Read(b)
+	if err != nil {
+		if isConnectionError(err) {
+			c.setConnected(false)
+			go c.reconnect()
+		}
+	}
+	return n, err
+}
+
+// Write - Will write data to freeswitch server
+func (c *Client) Write(b []byte) (n int, err error) {
+	n, err = c.Conn.Write(b)
+	if err != nil {
+		if isConnectionError(err) {
+			c.setConnected(false)
+			go c.reconnect()
+		}
+	}
+	return n, err
+}
+
+// 连接错误检测
+func isConnectionError(err error) bool {
+	if err == io.EOF {
+		return true
+	}
+	if netErr, ok := err.(net.Error); ok {
+		return netErr.Timeout() ||
+			strings.Contains(err.Error(), "connection refused") ||
+			strings.Contains(err.Error(), "broken pipe") ||
+			strings.Contains(err.Error(), "reset by peer") ||
+			strings.Contains(err.Error(), "connection closed") ||
+			strings.Contains(err.Error(), "use of closed network connection")
+	}
+	return false
 }

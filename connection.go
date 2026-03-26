@@ -223,9 +223,6 @@ func (c *SocketConnection) Handle() {
 
 // Close - Will close down net connection and return error if error happen
 func (c *SocketConnection) Close() error {
-	if c.Conn == nil {
-		return nil
-	}
 	if err := c.Conn.Close(); err != nil {
 		return err
 	}
